@@ -44,12 +44,52 @@ FLUX.2 [klein] does NOT improve prompts automatically. What you write is exactly
 ## For image editing (when reference images are involved)
 Focus on what should CHANGE, not what things look like. Patterns: "Turn into [style]", "Replace [element] with [new element]", "Add [element] to [location]", "Change [aspect] to [new state]".`;
 
-const API_URL = "https://api.cyberphotobooth.ru/api/handler";
+const API_SUBMIT_URL = "https://api.cyberphotobooth.ru/api/async/submit";
+const API_STATUS_URL = "https://api.cyberphotobooth.ru/api/async/status";
 
 const server = new McpServer({
   name: "budka-mcp",
   version: "1.0.0",
 });
+
+// Tool: get available models
+server.registerTool(
+  "get_models",
+  {
+    title: "Get Models",
+    description:
+      "Returns the list of available image generation models. Use this when user asks which models are available.",
+  },
+  async () => {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              models: [
+                {
+                  mode: "edit2_text",
+                  name: "Flux Klein",
+                  description: "Default model. High quality, detailed image generation.",
+                  default: true,
+                },
+                {
+                  mode: "nano-banana_text",
+                  name: "Nano Banana",
+                  description: "Alternative model. Use when specifically requested.",
+                  default: false,
+                },
+              ],
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
 
 // Tool: get available aspect ratios
 server.registerTool(
@@ -142,13 +182,94 @@ Generate the prompt now. Output ONLY the English prompt text, nothing else.`,
   }
 );
 
+// Tool: check job status
+server.registerTool(
+  "check_job",
+  {
+    title: "Check Job Status",
+    description:
+      "Check the status of a previously submitted image generation job. Use this if generate_image timed out or was interrupted, to retrieve the result without creating a new job.",
+    inputSchema: z.object({
+      job_id: z
+        .string()
+        .describe("The job ID returned by generate_image."),
+    }),
+  },
+  async ({ job_id }) => {
+    const apiKey = process.env["BUDKA_API_KEY"];
+    if (!apiKey) {
+      return {
+        content: [{ type: "text" as const, text: "Error: BUDKA_API_KEY is not set." }],
+        isError: true,
+      };
+    }
+
+    try {
+      const statusRes = await fetch(`${API_STATUS_URL}/${job_id}`, {
+        headers: {
+          accept: "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+      });
+
+      if (!statusRes.ok) {
+        return {
+          content: [{ type: "text" as const, text: `Status check failed: ${statusRes.status} ${statusRes.statusText}` }],
+          isError: true,
+        };
+      }
+
+      const data = (await statusRes.json()) as {
+        job_id?: string;
+        status?: string;
+        processing_time_ms?: number;
+        results?: { images?: string[]; videos?: string[] };
+        s3_urls?: { output?: string[] };
+        result?: string[];
+      };
+
+      if (data.status === "completed") {
+        const images = data.results?.images ?? data.result ?? [];
+        const outputUrls = data.s3_urls?.output ?? [];
+        const imageUrl = outputUrls[0];
+        const base64 = images[0];
+
+        const info = [
+          `Job ${job_id}: completed`,
+          imageUrl ? `URL: ${imageUrl}` : null,
+          data.processing_time_ms ? `Processing: ${(data.processing_time_ms / 1000).toFixed(1)}s` : null,
+        ].filter(Boolean).join("\n");
+
+        const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: "image/jpeg" }> = [
+          { type: "text" as const, text: info },
+        ];
+
+        if (base64) {
+          content.push({ type: "image" as const, data: base64, mimeType: "image/jpeg" as const });
+        }
+
+        return { content };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Job ${job_id}: ${data.status ?? "unknown"}\n\nFull response: ${JSON.stringify(data).slice(0, 1000)}` }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text" as const, text: `Request failed: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Tool: generate image via API
 server.registerTool(
   "generate_image",
   {
     title: "Generate Image",
     description:
-      "Generates an image using the Budka (CyberPhotoBooth) API with Flux Klein model. Returns the image URL. Requires BUDKA_API_KEY environment variable.",
+      "Generates an image using the Budka (CyberPhotoBooth) API. Async: submits a job then polls for result. Statuses: queued → processing → completed/failed. If timed out or interrupted, use check_job with the job_id to retrieve the result without creating a new job. Requires BUDKA_API_KEY.",
     inputSchema: z.object({
       prompt: z
         .string()
@@ -161,9 +282,15 @@ server.registerTool(
         .describe(
           "Aspect ratio for the generated image. Use get_aspect_ratios to see all options."
         ),
+      mode: z
+        .enum(["edit2_text", "nano-banana_text"])
+        .default("edit2_text")
+        .describe(
+          "Generation mode. edit2_text (default) — Flux Klein model. nano-banana_text — Nano Banana model, use when specifically requested."
+        ),
     }),
   },
-  async ({ prompt, ratio }) => {
+  async ({ prompt, ratio, mode }) => {
     const apiKey = process.env["BUDKA_API_KEY"];
     if (!apiKey) {
       return {
@@ -177,95 +304,152 @@ server.registerTool(
       };
     }
 
+    const log: string[] = [];
+    const startTime = Date.now();
+    const elapsed = () => ((Date.now() - startTime) / 1000).toFixed(1);
+    const headers = {
+      accept: "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    };
+
     try {
-      const response = await fetch(API_URL, {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
+      // Step 1: Submit async job
+      const requestBody = {
+        mode: mode,
+        style: "custom",
+        params: {
+          Prompt: prompt,
+          ratio: ratio,
         },
-        body: JSON.stringify({
-          mode: "edit2_text",
-          post_delivery: "false",
-          style: "custom",
-          params: {
-            Prompt: prompt,
-            ratio: ratio,
-          },
-        }),
+      };
+
+      log.push(`[${new Date().toISOString()}] Request: mode=${mode}, ratio=${ratio}`);
+      log.push(`[${elapsed()}s] Submitting async job...`);
+
+      const submitRes = await fetch(API_SUBMIT_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
       });
 
-      if (!response.ok) {
+      if (!submitRes.ok) {
+        const body = await submitRes.text().catch(() => "");
+        log.push(`[${elapsed()}s] Submit failed: ${submitRes.status} ${submitRes.statusText}`);
+        log.push(`[${elapsed()}s] Body: ${body.slice(0, 500)}`);
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `API error: ${response.status} ${response.statusText}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: `Submit error: ${submitRes.status} ${submitRes.statusText}\n\n--- Log ---\n${log.join("\n")}` }],
           isError: true,
         };
       }
 
-      const data = (await response.json()) as {
-        result?: string[];
-        s3_urls?: { output?: string[] };
+      const submitData = (await submitRes.json()) as {
+        job_id?: string;
+        status?: string;
+        estimated_wait_time_seconds?: number;
       };
 
-      const outputUrls = data.s3_urls?.output ?? [];
-      const base64Results = data.result ?? [];
-
-      if (outputUrls.length > 0) {
-        const imageUrl = outputUrls[0]!;
+      const jobId = submitData.job_id;
+      if (!jobId) {
+        log.push(`[${elapsed()}s] No job_id in response: ${JSON.stringify(submitData)}`);
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Image generated successfully!\n\nURL: ${imageUrl}\n\nPrompt used: ${prompt}\nAspect ratio: ${ratio}`,
-            },
-            {
-              type: "image" as const,
-              data: base64Results[0] ?? "",
-              mimeType: "image/jpeg" as const,
-            },
-          ],
+          content: [{ type: "text" as const, text: `No job_id returned.\n\n--- Log ---\n${log.join("\n")}` }],
+          isError: true,
         };
       }
 
-      if (base64Results.length > 0) {
-        return {
-          content: [
-            {
-              type: "image" as const,
-              data: base64Results[0]!,
-              mimeType: "image/jpeg" as const,
-            },
-            {
-              type: "text" as const,
-              text: `Image generated successfully!\n\nPrompt used: ${prompt}\nAspect ratio: ${ratio}`,
-            },
-          ],
+      log.push(`[${elapsed()}s] Job submitted: ${jobId} (status: ${submitData.status}, ETA: ${submitData.estimated_wait_time_seconds}s)`);
+
+      // Step 2: Poll for result
+      const maxPollTime = 360_000; // 6 minutes
+      const pollInterval = 3_000; // 3 seconds
+      let pollCount = 0;
+
+      while (Date.now() - startTime < maxPollTime) {
+        await new Promise((r) => setTimeout(r, pollInterval));
+        pollCount++;
+
+        const statusRes = await fetch(`${API_STATUS_URL}/${jobId}`, { headers });
+
+        if (!statusRes.ok) {
+          log.push(`[${elapsed()}s] Poll #${pollCount} failed: ${statusRes.status}`);
+          continue;
+        }
+
+        const statusData = (await statusRes.json()) as {
+          job_id?: string;
+          status?: string;
+          processing_time_ms?: number;
+          results?: { images?: string[]; videos?: string[] };
+          s3_urls?: { output?: string[] };
+          result?: string[];
         };
+
+        const status = statusData.status;
+        log.push(`[${elapsed()}s] Poll #${pollCount}: ${status}`);
+
+        if (status === "queued" || status === "processing") {
+          continue;
+        }
+
+        if (status === "failed") {
+          log.push(`[${elapsed()}s] Job failed. Response: ${JSON.stringify(statusData).slice(0, 500)}`);
+          return {
+            content: [{ type: "text" as const, text: `Generation failed.\n\n--- Log ---\n${log.join("\n")}` }],
+            isError: true,
+          };
+        }
+
+        if (status === "completed") {
+          const images = statusData.results?.images ?? statusData.result ?? [];
+          const outputUrls = statusData.s3_urls?.output ?? [];
+          const processingTime = statusData.processing_time_ms ? `${(statusData.processing_time_ms / 1000).toFixed(1)}s` : "unknown";
+
+          log.push(`[${elapsed()}s] Completed! Processing: ${processingTime}, images: ${images.length}, s3_urls: ${outputUrls.length}`);
+
+          const imageUrl = outputUrls[0];
+          const base64 = images[0];
+
+          const info = [
+            "Image generated successfully!",
+            "",
+            imageUrl ? `URL: ${imageUrl}` : null,
+            `Prompt: ${prompt}`,
+            `Ratio: ${ratio}`,
+            `Mode: ${mode}`,
+            `Job: ${jobId}`,
+            `Processing: ${processingTime}`,
+            "",
+            "--- Log ---",
+            ...log,
+          ].filter(Boolean).join("\n");
+
+          const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: "image/jpeg" }> = [
+            { type: "text" as const, text: info },
+          ];
+
+          if (base64) {
+            content.push({ type: "image" as const, data: base64, mimeType: "image/jpeg" as const });
+          }
+
+          return { content };
+        }
+
+        // Unknown status
+        log.push(`[${elapsed()}s] Unknown status: ${status}. Response: ${JSON.stringify(statusData).slice(0, 500)}`);
       }
 
+      // Timeout
+      log.push(`[${elapsed()}s] TIMEOUT: polling exceeded ${maxPollTime / 1000}s`);
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `API returned no image data. Raw response: ${JSON.stringify(data)}`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Timeout: generation took too long (>${maxPollTime / 1000}s).\nJob ID: ${jobId}\n\n--- Log ---\n${log.join("\n")}` }],
         isError: true,
       };
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log.push(`[${elapsed()}s] Error: ${msg}`);
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Request failed: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Request failed: ${msg}\n\n--- Log ---\n${log.join("\n")}` }],
         isError: true,
       };
     }

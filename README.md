@@ -1,6 +1,6 @@
 # Budka MCP
 
-MCP сервер для генерации изображений через [CyberPhotoBooth API](https://cyberphotobooth.ru) (модель Flux Klein).
+MCP сервер для генерации изображений через [CyberPhotoBooth API](https://cyberphotobooth.ru) 
 
 ## Инструменты
 
@@ -11,7 +11,7 @@ MCP сервер для генерации изображений через [Cy
 ## Установка
 
 ```bash
-git clone <repo>
+git clone https://github.com/curlysasha/CyberPhotoBooth_MCP.git
 cd Budka_MCP
 npm install
 npm run build

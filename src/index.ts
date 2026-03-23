@@ -4,21 +4,40 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const ASPECT_RATIOS = [
-  "1:1",
-  "2:3",
-  "3:4",
-  "5:8",
-  "9:16",
-  "9:19",
-  "9:21",
-  "3:2",
-  "4:3",
-  "8:5",
-  "16:9",
-  "19:9",
-  "21:9",
-] as const;
+const MODELS = {
+  "edit2_text": {
+    name: "Flux Klein",
+    description: "Default model. High quality, detailed image generation.",
+    default: true,
+    ratios: ["1:1", "2:3", "3:4", "5:8", "9:16", "9:19", "9:21", "3:2", "4:3", "8:5", "16:9", "19:9", "21:9"] as const,
+  },
+  "nano-banana_text": {
+    name: "Nano Banana",
+    description: "Alternative model. Fast generation, good for quick iterations.",
+    default: false,
+    ratios: ["1:1", "2:3", "3:4", "4:5", "9:16", "3:2", "4:3", "5:4", "16:9", "21:9"] as const,
+  },
+} as const;
+
+type ModelMode = keyof typeof MODELS;
+const ALL_RATIOS = [...new Set(Object.values(MODELS).flatMap((m) => [...m.ratios]))] as string[];
+const RATIO_DESCRIPTIONS: Record<string, string> = {
+  "1:1": "Square",
+  "2:3": "Portrait (vertical)",
+  "3:4": "Portrait (vertical, less tall)",
+  "4:5": "Portrait (close to square)",
+  "5:8": "Tall portrait",
+  "9:16": "Phone screen vertical",
+  "9:19": "Extra tall vertical",
+  "9:21": "Ultra tall vertical",
+  "3:2": "Landscape (classic photo)",
+  "4:3": "Landscape (standard)",
+  "5:4": "Landscape (close to square)",
+  "8:5": "Wide landscape",
+  "16:9": "Widescreen",
+  "19:9": "Ultra wide",
+  "21:9": "Cinematic ultra wide",
+};
 
 const PROMPT_SYSTEM = `You help write prompts for Flux Klein image generation model. Prompts are always in English.
 
@@ -61,30 +80,19 @@ server.registerTool(
       "Returns the list of available image generation models. Use this when user asks which models are available.",
   },
   async () => {
+    const models = Object.entries(MODELS).map(([mode, info]) => ({
+      mode,
+      name: info.name,
+      description: info.description,
+      default: info.default,
+      supported_ratios: [...info.ratios],
+    }));
+
     return {
       content: [
         {
           type: "text" as const,
-          text: JSON.stringify(
-            {
-              models: [
-                {
-                  mode: "edit2_text",
-                  name: "Flux Klein",
-                  description: "Default model. High quality, detailed image generation.",
-                  default: true,
-                },
-                {
-                  mode: "nano-banana_text",
-                  name: "Nano Banana",
-                  description: "Alternative model. Use when specifically requested.",
-                  default: false,
-                },
-              ],
-            },
-            null,
-            2
-          ),
+          text: JSON.stringify({ models }, null, 2),
         },
       ],
     };
@@ -97,37 +105,37 @@ server.registerTool(
   {
     title: "Get Aspect Ratios",
     description:
-      "Returns the list of available aspect ratios for image generation. Use this before generate_image to know which ratios are supported.",
+      "Returns the list of available aspect ratios for image generation. Pass a mode to get ratios for a specific model, or omit to see all ratios grouped by model.",
+    inputSchema: z.object({
+      mode: z
+        .enum(["edit2_text", "nano-banana_text"])
+        .optional()
+        .describe("Model mode. If provided, returns only ratios supported by this model."),
+    }),
   },
-  async () => {
-    return {
-      content: [
-        {
+  async ({ mode }) => {
+    if (mode) {
+      const model = MODELS[mode];
+      const ratios = model.ratios.map((r) => ({ ratio: r, description: RATIO_DESCRIPTIONS[r] ?? r }));
+      return {
+        content: [{
           type: "text" as const,
-          text: JSON.stringify(
-            {
-              aspect_ratios: ASPECT_RATIOS,
-              description: {
-                "1:1": "Square",
-                "2:3": "Portrait (vertical)",
-                "3:4": "Portrait (vertical, less tall)",
-                "5:8": "Tall portrait",
-                "9:16": "Phone screen vertical",
-                "9:19": "Extra tall vertical",
-                "9:21": "Ultra tall vertical",
-                "3:2": "Landscape (classic photo)",
-                "4:3": "Landscape (standard)",
-                "8:5": "Wide landscape",
-                "16:9": "Widescreen",
-                "19:9": "Ultra wide",
-                "21:9": "Cinematic ultra wide",
-              },
-            },
-            null,
-            2
-          ),
-        },
-      ],
+          text: JSON.stringify({ model: model.name, mode, ratios }, null, 2),
+        }],
+      };
+    }
+
+    const byModel = Object.entries(MODELS).map(([m, info]) => ({
+      model: info.name,
+      mode: m,
+      ratios: info.ratios.map((r) => ({ ratio: r, description: RATIO_DESCRIPTIONS[r] ?? r })),
+    }));
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({ models: byModel }, null, 2),
+      }],
     };
   }
 );
@@ -277,10 +285,10 @@ server.registerTool(
           "The image generation prompt in English. Use create_prompt tool first to craft an optimal prompt."
         ),
       ratio: z
-        .enum(ASPECT_RATIOS)
+        .string()
         .default("1:1")
         .describe(
-          "Aspect ratio for the generated image. Use get_aspect_ratios to see all options."
+          "Aspect ratio for the generated image. IMPORTANT: supported ratios differ by model. Use get_aspect_ratios(mode) or get_models to check. Flux Klein: 1:1,2:3,3:4,5:8,9:16,9:19,9:21,3:2,4:3,8:5,16:9,19:9,21:9. Nano Banana: 1:1,2:3,3:4,4:5,9:16,3:2,4:3,5:4,16:9,21:9."
         ),
       mode: z
         .enum(["edit2_text", "nano-banana_text"])
@@ -304,6 +312,19 @@ server.registerTool(
       };
     }
 
+    // Validate ratio for selected model
+    const modelInfo = MODELS[mode as ModelMode];
+    const supportedRatios = modelInfo.ratios as readonly string[];
+    if (!supportedRatios.includes(ratio)) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Error: ratio "${ratio}" is not supported by ${modelInfo.name} (${mode}).\n\nSupported ratios: ${supportedRatios.join(", ")}`,
+        }],
+        isError: true,
+      };
+    }
+
     const log: string[] = [];
     const startTime = Date.now();
     const elapsed = () => ((Date.now() - startTime) / 1000).toFixed(1);
@@ -315,13 +336,15 @@ server.registerTool(
 
     try {
       // Step 1: Submit async job
+      const params: Record<string, string> =
+        mode === "nano-banana_text"
+          ? { Prompt: prompt, aspect_ratio: ratio }
+          : { Prompt: prompt, ratio: ratio };
+
       const requestBody = {
         mode: mode,
         style: "custom",
-        params: {
-          Prompt: prompt,
-          ratio: ratio,
-        },
+        params,
       };
 
       log.push(`[${new Date().toISOString()}] Request: mode=${mode}, ratio=${ratio}`);

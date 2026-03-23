@@ -1,0 +1,12 @@
+{
+  "_comment": "Windows: [\"C:\\\\git\\\\Budka_MCP\\\\dist\\\\index.js\"], WSL: [\"/mnt/c/git/Budka_MCP/dist/index.js\"]",
+  "mcpServers": {
+    "budka": {
+      "command": "node",
+      "args": ["/path/to/Budka_MCP/dist/index.js"],
+      "env": {
+        "BUDKA_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
